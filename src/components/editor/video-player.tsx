@@ -1,0 +1,564 @@
+'use client';
+
+import React, { useRef, useEffect, useCallback, useState, useImperativeHandle, forwardRef } from 'react';
+import { useEditorStore } from '@/store/editor-store';
+import { Play, Pause, Volume2, VolumeX, Maximize2 } from 'lucide-react';
+import { computeDurationMs, getCSSTransitionParams } from '@/lib/transition-engine';
+
+/**
+ * Measured subtitle rendering data captured directly from the browser DOM.
+ * These values are the source of truth for the export pipeline.
+ * No estimation. No reference heights. Actual rendered pixels.
+ */
+export interface RenderedMeasurements {
+  // Container dimensions (the video preview area)
+  containerWidth: number;
+  containerHeight: number;
+  // Native video dimensions
+  videoWidth: number;
+  videoHeight: number;
+  // The exact scale ratio: nativeVideoHeight / containerHeight
+  // Multiply any CSS px value by this to get the native video coordinate
+  scaleFactor: number;
+  // Subtitle box: actual rendered CSS pixel values
+  fontSize: number;       // computed CSS fontSize in px
+  lineHeight: number;     // computed CSS lineHeight in px
+  paddingTop: number;     // computed CSS paddingTop in px
+  paddingBottom: number;
+  paddingLeft: number;
+  paddingRight: number;
+  maxWidth: number;       // computed CSS maxWidth in px (85% of container)
+  // Position: actual distance from container edge in CSS px
+  bottomOffset: number;   // distance from container bottom to subtitle bottom
+  // These are passed through as-is (not px values)
+  fontFamily: string;
+  fontWeight: number;
+  textColor: string;
+  backgroundColor: string;
+  strokeColor: string;
+  strokeWidth: number;
+  shadowColor: string;
+  shadowBlur: number;
+  alignment: string;
+  position: string;
+  highlightMode: string;
+  borderRadius: number;   // computed CSS borderRadius in px
+  layouts?: any[];        // Exact word positions for every segment
+}
+
+export interface VideoPlayerRef {
+  getRenderedMeasurements: () => RenderedMeasurements | null;
+}
+
+export const VideoPlayer = forwardRef<VideoPlayerRef>(function VideoPlayer(_props, ref) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const subtitleBoxRef = useRef<HTMLSpanElement>(null);
+  const hiddenMeasureRef = useRef<HTMLDivElement>(null);
+  const {
+    videoUrl,
+    currentTime,
+    isPlaying,
+    segments,
+    subtitleStyle,
+    setCurrentTime,
+    setDuration,
+    setIsPlaying,
+    setActiveSegmentIndex,
+  } = useEditorStore();
+
+  const [volume, setVolume] = useState(1);
+  const [isMuted, setIsMuted] = useState(false);
+  const [showControls, setShowControls] = useState(true);
+  const [videoDimensions, setVideoDimensions] = useState({ width: 16, height: 9 });
+  const hideTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Expose measurement function to parent via ref
+  useImperativeHandle(ref, () => ({
+    getRenderedMeasurements: (): RenderedMeasurements | null => {
+      const container = containerRef.current;
+      const video = videoRef.current;
+      const subtitleBox = subtitleBoxRef.current;
+
+      if (!container || !video) return null;
+
+      const containerRect = container.getBoundingClientRect();
+      const nativeW = video.videoWidth || 1920;
+      const nativeH = video.videoHeight || 1080;
+
+      // The exact scale factor: how many native pixels per CSS pixel
+      const scaleFactor = nativeH / containerRect.height;
+
+      // Measure subtitle box if it exists, otherwise use style defaults
+      let fontSize = subtitleStyle.fontSize;
+      let lineHeight = subtitleStyle.fontSize * 1.375;
+      let paddingTop = 6;
+      let paddingBottom = 6;
+      let paddingLeft = 12;
+      let paddingRight = 12;
+      let maxWidth = containerRect.width * 0.85;
+      let bottomOffset = 64;
+      let borderRadius = 6;
+
+      if (subtitleBox) {
+        const cs = getComputedStyle(subtitleBox);
+        fontSize = parseFloat(cs.fontSize);
+        lineHeight = parseFloat(cs.lineHeight) || fontSize * 1.375;
+        paddingTop = parseFloat(cs.paddingTop);
+        paddingBottom = parseFloat(cs.paddingBottom);
+        paddingLeft = parseFloat(cs.paddingLeft);
+        paddingRight = parseFloat(cs.paddingRight);
+        maxWidth = parseFloat(cs.maxWidth) || containerRect.width * 0.85;
+        borderRadius = parseFloat(cs.borderRadius) || 6;
+
+        // Measure actual bottom offset
+        const boxRect = subtitleBox.getBoundingClientRect();
+        bottomOffset = containerRect.bottom - boxRect.bottom;
+      }
+
+      // Collect precise pixel layout for all segments
+      const layouts: any[] = [];
+      const measureContainer = hiddenMeasureRef.current;
+      if (measureContainer) {
+        const segSpans = measureContainer.querySelectorAll('[data-measure-segment]');
+        segSpans.forEach(segSpan => {
+           const words: any[] = [];
+           const wordSpans = segSpan.querySelectorAll('[data-measure-word]');
+           wordSpans.forEach(wSpan => {
+              const wRect = wSpan.getBoundingClientRect();
+              words.push({
+                 word: wSpan.textContent || '',
+                 x: wRect.left - containerRect.left,
+                 y: wRect.top - containerRect.top,
+                 w: wRect.width,
+                 h: wRect.height
+              });
+           });
+           const segRect = segSpan.getBoundingClientRect();
+           layouts.push({ 
+             words,
+             box: {
+               x: segRect.left - containerRect.left,
+               y: segRect.top - containerRect.top,
+               w: segRect.width,
+               h: segRect.height
+             }
+           });
+        });
+      }
+
+      return {
+        containerWidth: containerRect.width,
+        containerHeight: containerRect.height,
+        videoWidth: nativeW,
+        videoHeight: nativeH,
+        scaleFactor,
+        fontSize,
+        lineHeight,
+        paddingTop,
+        paddingBottom,
+        paddingLeft,
+        paddingRight,
+        maxWidth,
+        bottomOffset,
+        fontFamily: subtitleStyle.font.family,
+        fontWeight: subtitleStyle.font.weight,
+        textColor: subtitleStyle.textColor.solid,
+        backgroundColor: subtitleStyle.background.color,
+        strokeColor: subtitleStyle.stroke.color,
+        strokeWidth: subtitleStyle.stroke.width,
+        shadowColor: subtitleStyle.shadow.color,
+        shadowBlur: subtitleStyle.shadow.blur,
+        shadowOffsetX: subtitleStyle.shadow.offsetX,
+        shadowOffsetY: subtitleStyle.shadow.offsetY,
+        alignment: subtitleStyle.alignment,
+        position: subtitleStyle.positionY > 0 ? 'top' : subtitleStyle.positionY < 0 ? 'bottom' : 'center',
+        positionX: subtitleStyle.positionX,
+        positionY: subtitleStyle.positionY,
+        highlightMode: subtitleStyle.highlightMode,
+        activeWordColor: subtitleStyle.activeWordColor,
+        inactiveOpacity: subtitleStyle.inactiveOpacity,
+        letterSpacing: subtitleStyle.letterSpacing,
+        wordSpacing: subtitleStyle.wordSpacing,
+        lineSpacing: subtitleStyle.lineSpacing,
+        blur: subtitleStyle.blur,
+        fontItalic: subtitleStyle.font.italic,
+        fontUnderline: subtitleStyle.font.underline,
+        fontTextTransform: subtitleStyle.font.textTransform,
+        transition: subtitleStyle.transition,
+        borderRadius,
+        layouts,
+      };
+    },
+  }));
+
+  // Dynamic Google Font Loader
+  useEffect(() => {
+    const font = subtitleStyle.font?.family || 'Inter';
+    const safeFonts = ['Inter', 'Arial', 'Helvetica', 'Georgia', 'Courier New'];
+    if (!font || safeFonts.includes(font)) return;
+
+    const fontId = `google-font-${font.replace(/\s+/g, '-').toLowerCase()}`;
+    if (!document.getElementById(fontId)) {
+      const link = document.createElement('link');
+      link.id = fontId;
+      link.rel = 'stylesheet';
+      link.href = `https://fonts.googleapis.com/css2?family=${font.replace(/\s+/g, '+')}:wght@400;700;900&display=swap`;
+      document.head.appendChild(link);
+    }
+
+    const teluguFontId = 'google-font-noto-sans-telugu';
+    if (!document.getElementById(teluguFontId)) {
+      const link2 = document.createElement('link');
+      link2.id = teluguFontId;
+      link2.rel = 'stylesheet';
+      link2.href = `https://fonts.googleapis.com/css2?family=Noto+Sans+Telugu:wght@400;700;900&display=swap`;
+      document.head.appendChild(link2);
+    }
+  }, [subtitleStyle.font.family]);
+
+  // Find active segment based on current time
+  const activeSegment = segments.find(
+    (seg) => currentTime >= seg.start && currentTime <= seg.end
+  );
+
+  const activeSegmentWords = React.useMemo(() => {
+    return activeSegment ? activeSegment.words : [];
+  }, [activeSegment]);
+
+  // Sync video time → store
+  const handleTimeUpdate = useCallback(() => {
+    if (videoRef.current) {
+      const time = videoRef.current.currentTime;
+      setCurrentTime(time);
+      const idx = segments.findIndex(
+        (seg) => time >= seg.start && time <= seg.end
+      );
+      setActiveSegmentIndex(idx);
+    }
+  }, [segments, setCurrentTime, setActiveSegmentIndex]);
+
+  // Sync store time → video (seek from transcript clicks)
+  useEffect(() => {
+    if (videoRef.current && Math.abs(videoRef.current.currentTime - currentTime) > 0.5) {
+      videoRef.current.currentTime = currentTime;
+    }
+  }, [currentTime]);
+
+  const handleLoadedMetadata = useCallback(() => {
+    if (videoRef.current) {
+      setDuration(videoRef.current.duration);
+      setVideoDimensions({
+        width: videoRef.current.videoWidth || 16,
+        height: videoRef.current.videoHeight || 9,
+      });
+    }
+  }, [setDuration]);
+
+  const togglePlay = useCallback(() => {
+    if (!videoRef.current) return;
+    if (isPlaying) {
+      videoRef.current.pause();
+    } else {
+      videoRef.current.play();
+    }
+    setIsPlaying(!isPlaying);
+  }, [isPlaying, setIsPlaying]);
+
+  const handleVolumeChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value);
+    setVolume(val);
+    setIsMuted(val === 0);
+    if (videoRef.current) videoRef.current.volume = val;
+  }, []);
+
+  const toggleMute = useCallback(() => {
+    if (videoRef.current) {
+      const newMuted = !isMuted;
+      setIsMuted(newMuted);
+      videoRef.current.volume = newMuted ? 0 : volume;
+    }
+  }, [isMuted, volume]);
+
+  const toggleFullscreen = useCallback(() => {
+    if (containerRef.current) {
+      if (document.fullscreenElement) {
+        document.exitFullscreen();
+      } else {
+        containerRef.current.requestFullscreen();
+      }
+    }
+  }, []);
+
+  const handleMouseMove = useCallback(() => {
+    setShowControls(true);
+    if (hideTimeoutRef.current) clearTimeout(hideTimeoutRef.current);
+    hideTimeoutRef.current = setTimeout(() => {
+      if (isPlaying) setShowControls(false);
+    }, 2500);
+  }, [isPlaying]);
+
+  const handleProgressClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (!videoRef.current) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = (e.clientX - rect.left) / rect.width;
+    const newTime = ratio * videoRef.current.duration;
+    videoRef.current.currentTime = newTime;
+    setCurrentTime(newTime);
+  }, [setCurrentTime]);
+
+  // Subtitle position: direct CSS values (these ARE the source of truth)
+  const positionClass = subtitleStyle.positionY > 20
+    ? 'top-8'
+    : subtitleStyle.positionY > -20 && subtitleStyle.positionY < 20
+    ? 'top-1/2 -translate-y-1/2'
+    : 'bottom-16';
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative bg-black rounded-xl overflow-hidden shadow-2xl group flex items-center justify-center max-w-full max-h-full"
+      style={{ aspectRatio: `${videoDimensions.width} / ${videoDimensions.height}` }}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => isPlaying && setShowControls(false)}
+    >
+      {videoUrl ? (
+        <video
+          ref={videoRef}
+          src={videoUrl}
+          className="w-full h-full object-cover"
+          onTimeUpdate={handleTimeUpdate}
+          onLoadedMetadata={handleLoadedMetadata}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          onEnded={() => setIsPlaying(false)}
+          playsInline
+        />
+      ) : (
+        <div className="flex items-center justify-center h-full">
+          <p className="text-zinc-600 text-sm">Loading video...</p>
+        </div>
+      )}
+
+      {/* Hidden Layout Measurement Container */}
+      <div
+        ref={hiddenMeasureRef}
+        className={`absolute left-0 right-0 pointer-events-none opacity-0 ${positionClass}`}
+        style={{
+          justifyContent: subtitleStyle.alignment === 'left' ? 'flex-start' : subtitleStyle.alignment === 'right' ? 'flex-end' : 'center',
+          padding: '0 24px',
+          zIndex: -1,
+          transform: `translateX(${subtitleStyle.positionX}%)`,
+        }}
+      >
+        {segments.map((seg, sIdx) => (
+          <span
+            key={sIdx}
+            data-measure-segment={sIdx}
+            className="px-3 py-1.5 rounded-md max-w-[85%] text-center absolute top-0"
+            style={{
+              fontFamily: `"${subtitleStyle.font.family}", "Noto Sans Telugu", "Noto Sans Arabic", "Noto Sans JP", sans-serif`,
+              fontSize: `${subtitleStyle.fontSize}px`,
+              fontWeight: subtitleStyle.font.weight,
+              letterSpacing: `${subtitleStyle.letterSpacing}px`,
+              wordSpacing: `${subtitleStyle.wordSpacing}px`,
+              lineHeight: subtitleStyle.lineSpacing,
+            }}
+          >
+            {seg.words.length > 0 ? seg.words.map((w, wIdx) => (
+              <span key={wIdx} data-measure-word={wIdx} style={{ marginRight: '6px', display: 'inline-block', padding: '0 2px' }}>
+                {w.word.trim()}
+              </span>
+            )) : <span data-measure-word={0}>{seg.text}</span>}
+          </span>
+        ))}
+      </div>
+
+      {/* Subtitle Overlay */}
+      {activeSegment && (
+        <div
+          className={`absolute left-0 right-0 flex pointer-events-none ${positionClass}`}
+          style={{
+            justifyContent: subtitleStyle.alignment === 'left' ? 'flex-start' : subtitleStyle.alignment === 'right' ? 'flex-end' : 'center',
+            padding: '0 24px',
+            transform: `translateX(${subtitleStyle.positionX}%)`,
+          }}
+        >
+          <span
+            ref={subtitleBoxRef}
+            className="px-3 py-1.5 rounded-md max-w-[85%] text-center"
+            style={{
+              fontFamily: `"${subtitleStyle.font.family}", "Noto Sans Telugu", "Noto Sans Arabic", "Noto Sans JP", sans-serif`,
+              fontSize: `${subtitleStyle.fontSize}px`,
+              fontWeight: subtitleStyle.font.weight,
+              letterSpacing: `${subtitleStyle.letterSpacing}px`,
+              wordSpacing: `${subtitleStyle.wordSpacing}px`,
+              lineHeight: subtitleStyle.lineSpacing,
+              color: subtitleStyle.textColor.solid,
+              backgroundColor: subtitleStyle.background.enabled ? subtitleStyle.background.color : 'transparent',
+              textShadow: subtitleStyle.shadow.blur > 0 ? `0 0 ${subtitleStyle.shadow.blur}px ${subtitleStyle.shadow.color}` : undefined,
+              WebkitTextStroke: subtitleStyle.stroke.enabled && subtitleStyle.stroke.width > 0 ? `${subtitleStyle.stroke.width}px ${subtitleStyle.stroke.color}` : undefined,
+            }}
+          >
+            {activeSegmentWords.length > 0 ? (
+              activeSegmentWords.map((wordObj, i) => {
+                const isWordActive = currentTime >= wordObj.start && currentTime <= wordObj.end;
+                const hasStarted = currentTime >= wordObj.start;
+                const mode = subtitleStyle.highlightMode || 'none';
+                
+                // 1. Transition Engine
+                const durationMs = computeDurationMs(subtitleStyle.transition, wordObj.start, wordObj.end);
+                const transitionParams = getCSSTransitionParams(subtitleStyle.transition.type, durationMs);
+                
+                // Active/Inactive state based on transition
+                const transitionState = hasStarted ? transitionParams.activeStyle : transitionParams.initialStyle;
+
+                // 2. Base Style
+                const dynamicStyle: React.CSSProperties = {
+                  color: subtitleStyle.textColor.solid,
+                  opacity: hasStarted ? 1.0 : subtitleStyle.inactiveOpacity ?? 0.5,
+                  filter: !hasStarted && subtitleStyle.blur > 0 ? `blur(${subtitleStyle.blur}px)` : undefined,
+                  transform: 'scale(1)',
+                  textDecoration: 'none',
+                  backgroundColor: 'transparent',
+                  marginRight: '6px',
+                  display: 'inline-block',
+                  transition: `all ${transitionParams.durationMs}ms ${transitionParams.easing}`,
+                  padding: '0 2px',
+                  borderRadius: '4px',
+                  ...transitionState, // Apply initial or active transform/opacity
+                };
+
+                // 3. Highlight Mode (only applies while actively spoken)
+                if (isWordActive && mode !== 'none') {
+                  switch (mode) {
+                    case 'color':
+                      dynamicStyle.color = subtitleStyle.activeWordColor || '#facc15';
+                      dynamicStyle.opacity = 1.0;
+                      break;
+                    case 'scale':
+                      dynamicStyle.transform = 'scale(1.15)';
+                      dynamicStyle.opacity = 1.0;
+                      break;
+                    case 'underline':
+                      dynamicStyle.textDecoration = 'underline';
+                      dynamicStyle.textUnderlineOffset = '4px';
+                      dynamicStyle.opacity = 1.0;
+                      break;
+                    case 'background':
+                      dynamicStyle.backgroundColor = subtitleStyle.activeWordColor || '#facc15';
+                      dynamicStyle.color = '#000000';
+                      dynamicStyle.opacity = 1.0;
+                      break;
+                    case 'karaoke':
+                      dynamicStyle.color = subtitleStyle.activeWordColor || '#facc15';
+                      dynamicStyle.transform = 'scale(1.1)';
+                      dynamicStyle.textShadow = `0 0 12px ${subtitleStyle.activeWordColor || '#facc15'}CC`;
+                      dynamicStyle.opacity = 1.0;
+                      break;
+                  }
+                }
+
+                return (
+                  <span
+                    key={i}
+                    style={dynamicStyle}
+                  >
+                    {wordObj.word.trim()}
+                  </span>
+                );
+              })
+            ) : (
+              activeSegment.text
+            )}
+          </span>
+        </div>
+      )}
+
+      {/* Custom Controls */}
+      <div
+        className={`absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-4 transition-opacity duration-300 ${
+          showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
+        }`}
+      >
+        <div
+          className="w-full h-1.5 bg-white/20 rounded-full cursor-pointer mb-3 group/progress"
+          onClick={handleProgressClick}
+        >
+          <div
+            className="h-full bg-violet-500 rounded-full relative transition-all"
+            style={{
+              width: videoRef.current?.duration
+                ? `${(currentTime / videoRef.current.duration) * 100}%`
+                : '0%',
+            }}
+          >
+            <div className="absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full opacity-0 group-hover/progress:opacity-100 transition-opacity" />
+          </div>
+        </div>
+
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={togglePlay}
+              className="w-8 h-8 flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 transition-colors"
+            >
+              {isPlaying ? (
+                <Pause className="w-4 h-4 text-white" />
+              ) : (
+                <Play className="w-4 h-4 text-white ml-0.5" />
+              )}
+            </button>
+
+            <div className="flex items-center gap-2">
+              <button onClick={toggleMute} className="text-white/70 hover:text-white transition-colors">
+                {isMuted || volume === 0 ? (
+                  <VolumeX className="w-4 h-4" />
+                ) : (
+                  <Volume2 className="w-4 h-4" />
+                )}
+              </button>
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={isMuted ? 0 : volume}
+                onChange={handleVolumeChange}
+                className="w-16 h-1 accent-violet-500"
+              />
+            </div>
+
+            <span className="text-xs text-white/60 font-mono tabular-nums">
+              {formatTime(currentTime)} / {formatTime(videoRef.current?.duration ?? 0)}
+            </span>
+          </div>
+
+          <button
+            onClick={toggleFullscreen}
+            className="text-white/70 hover:text-white transition-colors"
+          >
+            <Maximize2 className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      {!isPlaying && videoUrl && (
+        <button
+          onClick={togglePlay}
+          className="absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 hover:opacity-100 transition-opacity"
+        >
+          <div className="w-16 h-16 flex items-center justify-center rounded-full bg-white/20 backdrop-blur-sm">
+            <Play className="w-8 h-8 text-white ml-1" />
+          </div>
+        </button>
+      )}
+    </div>
+  );
+});
+
+function formatTime(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+}
